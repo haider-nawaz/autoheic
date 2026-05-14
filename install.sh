@@ -67,7 +67,8 @@ done
 
 # Bootstrap: when run via `curl | bash`, the script has no neighboring repo
 # files. Detect that and clone the latest into a temp dir, then re-exec.
-SCRIPT_DIR=$(cd "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)
+SCRIPT_DIR=$(cd "$(dirname -- "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)
+[[ -z "$SCRIPT_DIR" ]] && SCRIPT_DIR=$PWD
 if [[ ! -f "$SCRIPT_DIR/applescript/autoheic-trigger.applescript" ]]; then
   command -v curl >/dev/null || die "curl is required for the one-liner install"
   command -v tar >/dev/null || die "tar is required"
@@ -90,8 +91,9 @@ case "$FORMAT" in
   jpeg|png|tiff|webp) ;;
   *) die "invalid --format=$FORMAT (must be jpeg, png, tiff, webp)" ;;
 esac
-[[ "$QUALITY" =~ ^[0-9]+$ ]] && (( QUALITY >= 0 && QUALITY <= 100 )) \
-  || die "invalid --quality=$QUALITY (must be 0–100)"
+if [[ ! "$QUALITY" =~ ^[0-9]+$ ]] || (( QUALITY < 0 || QUALITY > 100 )); then
+  die "invalid --quality=$QUALITY (must be 0–100)"
+fi
 
 # Interactive prompts.
 if [[ $INTERACTIVE -eq 1 ]]; then
@@ -153,8 +155,9 @@ EOF
       printf 'Quality 0–100 [%s]: ' "$QUALITY"
       read -r ans
       [[ -n "${ans:-}" ]] && QUALITY="$ans"
-      [[ "$QUALITY" =~ ^[0-9]+$ ]] && (( QUALITY >= 0 && QUALITY <= 100 )) \
-        || die "invalid quality: $QUALITY"
+      if [[ ! "$QUALITY" =~ ^[0-9]+$ ]] || (( QUALITY < 0 || QUALITY > 100 )); then
+        die "invalid quality: $QUALITY"
+      fi
       ;;
   esac
 

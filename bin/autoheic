@@ -196,7 +196,9 @@ cmd_config() {
           esac
           ;;
         quality)
-          [[ "$val" =~ ^[0-9]+$ ]] && (( val >= 0 && val <= 100 )) || die "quality must be 0–100"
+          if [[ ! "$val" =~ ^[0-9]+$ ]] || (( val < 0 || val > 100 )); then
+            die "quality must be 0–100"
+          fi
           AUTOHEIC_QUALITY="$val"
           ;;
         keep_originals|keep_original)

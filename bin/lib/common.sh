@@ -1,6 +1,9 @@
 #!/bin/bash
 # Shared helpers for autoheic. Sourced by `autoheic` and `heic-convert-one`.
+# Variables defined below are consumed by scripts that source this file,
+# so shellcheck's "unused" warnings (SC2034) don't apply here.
 # shellcheck shell=bash
+# shellcheck disable=SC2034
 
 AUTOHEIC_VERSION="0.1.0"
 

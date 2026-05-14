@@ -1,0 +1,76 @@
+#!/bin/bash
+# Convert one HEIC/HEIF file (passed as $1) to the configured output format.
+# Invoked once per file by the autoheic Folder Action trigger.
+
+set -u
+
+SELF_DIR=$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck disable=SC1091
+source "$SELF_DIR/lib/common.sh"
+
+autoheic_load_config
+
+src="${1:-}"
+if [[ -z "$src" ]]; then
+  autoheic_log "FAILED (no input path)"
+  exit 1
+fi
+
+if [[ ! -f "$src" ]]; then
+  autoheic_log "skip (missing): $src"
+  exit 0
+fi
+
+out_ext=$(autoheic_format_ext "$AUTOHEIC_FORMAT") || {
+  autoheic_log "FAILED (bad format=$AUTOHEIC_FORMAT): $src"
+  exit 1
+}
+sips_format=$(autoheic_sips_format "$AUTOHEIC_FORMAT")
+
+dir=$(dirname -- "$src")
+base=$(basename -- "$src")
+base="${base%.*}"
+out="${dir}/${base}.${out_ext}"
+i=1
+while [[ -e "$out" ]]; do
+  out="${dir}/${base}-${i}.${out_ext}"
+  i=$((i + 1))
+done
+
+# Wait up to ~5s for the file size to stabilize. Handles in-flight AirDrop /
+# browser-download writes where the file appears before it's finished.
+prev=-1
+for _ in 1 2 3 4 5; do
+  curr=$(stat -f %z "$src" 2>/dev/null) || {
+    autoheic_log "skip (vanished): $src"
+    exit 0
+  }
+  [[ "$curr" == "$prev" && "$curr" -gt 0 ]] && break
+  prev="$curr"
+  sleep 1
+done
+
+# Build sips arguments. Only jpeg & webp accept formatOptions (quality).
+sips_args=(-s format "$sips_format")
+case "$AUTOHEIC_FORMAT" in
+  jpeg|webp) sips_args+=(-s formatOptions "$AUTOHEIC_QUALITY") ;;
+esac
+
+if /usr/bin/sips "${sips_args[@]}" "$src" --out "$out" >/dev/null 2>&1; then
+  if [[ -s "$out" ]]; then
+    if [[ "$AUTOHEIC_KEEP_ORIGINAL" == "1" ]]; then
+      autoheic_log "converted (kept original): $src -> $out"
+    else
+      rm -f -- "$src"
+      autoheic_log "converted: $src -> $out"
+    fi
+    exit 0
+  else
+    autoheic_log "FAILED (empty output): $src"
+    rm -f -- "$out"
+    exit 1
+  fi
+else
+  autoheic_log "FAILED (sips error): $src"
+  exit 1
+fi

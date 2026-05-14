@@ -1,0 +1,403 @@
+#!/bin/bash
+# autoheic — manage HEIC auto-conversion on macOS.
+# https://github.com/haider-nawaz/autoheic
+
+set -u
+
+SELF_DIR=$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck disable=SC1091
+source "$SELF_DIR/lib/common.sh"
+
+autoheic_load_config
+
+# ---------- helpers ----------
+
+die() { printf 'autoheic: %s\n' "$*" >&2; exit 1; }
+
+ah_attach_folder() {
+  local abs="$1"
+  AH_PATH="$abs" AH_SCRIPT="$AUTOHEIC_SCRIPT_NAME" osascript <<'APPLESCRIPT'
+set targetPath to system attribute "AH_PATH"
+set scriptName to system attribute "AH_SCRIPT"
+tell application "System Events"
+  set folder actions enabled to true
+  set faName to ""
+  repeat with fa in folder actions
+    if (path of fa) is targetPath then
+      set faName to (name of fa)
+      exit repeat
+    end if
+  end repeat
+  if faName is "" then
+    set faName to targetPath
+    make new folder action at end of folder actions with properties {name:faName, path:targetPath, enabled:true}
+  end if
+  tell folder action faName
+    set scriptAttached to false
+    repeat with s in scripts
+      if (name of s) is scriptName then
+        set scriptAttached to true
+        exit repeat
+      end if
+    end repeat
+    if not scriptAttached then
+      make new script with properties {name:scriptName}
+    end if
+    set enabled to true
+  end tell
+end tell
+APPLESCRIPT
+}
+
+ah_detach_folder() {
+  local abs="$1"
+  AH_PATH="$abs" AH_SCRIPT="$AUTOHEIC_SCRIPT_NAME" osascript <<'APPLESCRIPT'
+set targetPath to system attribute "AH_PATH"
+set scriptName to system attribute "AH_SCRIPT"
+tell application "System Events"
+  set wasRemoved to false
+  repeat with fa in folder actions
+    if (path of fa) is targetPath then
+      set otherCount to 0
+      repeat with s in scripts of fa
+        if (name of s) is not scriptName then set otherCount to otherCount + 1
+      end repeat
+      if otherCount is 0 then
+        delete fa
+      else
+        repeat with s in scripts of fa
+          if (name of s) is scriptName then delete s
+        end repeat
+      end if
+      set wasRemoved to true
+      exit repeat
+    end if
+  end repeat
+  return wasRemoved as text
+end tell
+APPLESCRIPT
+}
+
+ah_list_folders() {
+  AH_SCRIPT="$AUTOHEIC_SCRIPT_NAME" osascript <<'APPLESCRIPT'
+set scriptName to system attribute "AH_SCRIPT"
+tell application "System Events"
+  set out to ""
+  repeat with fa in folder actions
+    repeat with s in scripts of fa
+      if (name of s) is scriptName then
+        set out to out & (path of fa) & linefeed
+        exit repeat
+      end if
+    end repeat
+  end repeat
+  return out
+end tell
+APPLESCRIPT
+}
+
+_write_config() {
+  mkdir -p "$AUTOHEIC_CONFIG_DIR"
+  cat > "$AUTOHEIC_CONFIG_FILE" <<EOF
+# autoheic configuration — managed by 'autoheic config set ...'
+AUTOHEIC_FORMAT="$AUTOHEIC_FORMAT"
+AUTOHEIC_QUALITY=$AUTOHEIC_QUALITY
+AUTOHEIC_KEEP_ORIGINAL=$AUTOHEIC_KEEP_ORIGINAL
+AUTOHEIC_LOG="\$HOME/Library/Logs/autoheic.log"
+EOF
+}
+
+# ---------- subcommands ----------
+
+cmd_version() { printf 'autoheic %s\n' "$AUTOHEIC_VERSION"; }
+
+cmd_list() {
+  local out
+  out=$(ah_list_folders)
+  if [[ -z "$out" ]]; then
+    echo "(no folders attached — try: autoheic add ~/Downloads)"
+  else
+    printf '%s' "$out"
+  fi
+}
+
+cmd_status() {
+  printf 'autoheic %s\n\n' "$AUTOHEIC_VERSION"
+  printf 'Config (%s):\n' "$AUTOHEIC_CONFIG_FILE"
+  printf '  format          %s\n' "$AUTOHEIC_FORMAT"
+  printf '  quality         %s\n' "$AUTOHEIC_QUALITY"
+  printf '  keep_originals  %s\n' "$([[ $AUTOHEIC_KEEP_ORIGINAL == 1 ]] && echo yes || echo no)"
+  printf '  log             %s\n\n' "$AUTOHEIC_LOG"
+  printf 'Watched folders:\n'
+  local folders
+  folders=$(ah_list_folders)
+  if [[ -z "$folders" ]]; then
+    echo "  (none — use: autoheic add <folder>)"
+  else
+    printf '%s' "$folders" | sed 's/^/  /'
+  fi
+  printf '\nRecent log entries:\n'
+  if [[ -f "$AUTOHEIC_LOG" ]]; then
+    tail -5 "$AUTOHEIC_LOG" | sed 's/^/  /'
+  else
+    echo "  (no log file yet)"
+  fi
+}
+
+cmd_add() {
+  [[ $# -ge 1 ]] || die "usage: autoheic add <folder>"
+  [[ -f "$AUTOHEIC_SCRIPT_PATH" ]] || die "trigger script missing at $AUTOHEIC_SCRIPT_PATH — re-run install.sh"
+  local resolved
+  resolved=$(autoheic_resolve_folder "$1") || die "not a directory: $1"
+  ah_attach_folder "$resolved" >/dev/null
+  printf 'Attached to: %s\n' "$resolved"
+  printf 'macOS may prompt for folder access the first time a file arrives. Click Allow.\n'
+}
+
+cmd_remove() {
+  [[ $# -ge 1 ]] || die "usage: autoheic remove <folder>"
+  local resolved
+  resolved=$(autoheic_resolve_folder "$1") || resolved="$1"
+  local result
+  result=$(ah_detach_folder "$resolved")
+  if [[ "$result" == "true" ]]; then
+    printf 'Detached from: %s\n' "$resolved"
+  else
+    printf 'No attachment found for: %s\n' "$resolved"
+  fi
+}
+
+cmd_config() {
+  local action="${1:-list}"
+  shift || true
+  case "$action" in
+    get)
+      [[ $# -ge 1 ]] || die "usage: autoheic config get <key>"
+      local key="$1" var
+      case "$key" in
+        format) var="AUTOHEIC_FORMAT" ;;
+        quality) var="AUTOHEIC_QUALITY" ;;
+        keep_originals|keep_original) var="AUTOHEIC_KEEP_ORIGINAL" ;;
+        log) var="AUTOHEIC_LOG" ;;
+        *) die "unknown key: $key (valid: format, quality, keep_originals, log)" ;;
+      esac
+      printf '%s\n' "${!var}"
+      ;;
+    set)
+      [[ $# -ge 1 ]] || die "usage: autoheic config set <key>=<value>"
+      local pair="$1" key val
+      key="${pair%%=*}"
+      val="${pair#*=}"
+      [[ "$pair" == *=* ]] || die "expected key=value"
+      case "$key" in
+        format)
+          case "$val" in jpeg|png|tiff|webp) AUTOHEIC_FORMAT="$val" ;;
+            *) die "format must be one of: jpeg, png, tiff, webp" ;;
+          esac
+          ;;
+        quality)
+          [[ "$val" =~ ^[0-9]+$ ]] && (( val >= 0 && val <= 100 )) || die "quality must be 0–100"
+          AUTOHEIC_QUALITY="$val"
+          ;;
+        keep_originals|keep_original)
+          case "$val" in
+            1|true|yes|on) AUTOHEIC_KEEP_ORIGINAL=1 ;;
+            0|false|no|off) AUTOHEIC_KEEP_ORIGINAL=0 ;;
+            *) die "keep_originals must be 0/1 or yes/no" ;;
+          esac
+          ;;
+        *) die "unknown key: $key (valid: format, quality, keep_originals)" ;;
+      esac
+      _write_config
+      printf '%s=%s\n' "$key" "$val"
+      ;;
+    list|"")
+      printf 'format          = %s\n' "$AUTOHEIC_FORMAT"
+      printf 'quality         = %s\n' "$AUTOHEIC_QUALITY"
+      printf 'keep_originals  = %s\n' "$AUTOHEIC_KEEP_ORIGINAL"
+      printf 'log             = %s\n' "$AUTOHEIC_LOG"
+      ;;
+    *) die "usage: autoheic config [get|set|list] [key|key=value]" ;;
+  esac
+}
+
+cmd_sweep() {
+  local converter="$SELF_DIR/heic-convert-one"
+  [[ -x "$converter" ]] || die "converter not found at $converter — re-run install.sh"
+  local targets=()
+  if [[ $# -ge 1 ]]; then
+    for f in "$@"; do
+      local r
+      r=$(autoheic_resolve_folder "$f") || die "not a directory: $f"
+      targets+=("$r")
+    done
+  else
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && targets+=("$line")
+    done < <(ah_list_folders)
+    [[ ${#targets[@]} -gt 0 ]] || die "no attached folders (pass one explicitly, or add some with 'autoheic add')"
+  fi
+  local total=0
+  for dir in "${targets[@]}"; do
+    [[ -d "$dir" ]] || { printf 'skip (missing): %s\n' "$dir"; continue; }
+    printf 'Sweeping %s\n' "$dir"
+    while IFS= read -r -d '' f; do
+      if "$converter" "$f"; then
+        total=$((total + 1))
+      fi
+    done < <(find "$dir" -maxdepth 1 -type f \( -iname '*.heic' -o -iname '*.heif' \) -print0 2>/dev/null)
+  done
+  printf 'Done — %s file(s) processed. See log: %s\n' "$total" "$AUTOHEIC_LOG"
+}
+
+cmd_doctor() {
+  local fail=0
+  _check() {
+    local label="$1" status="$2" detail="${3:-}"
+    if [[ "$status" == "PASS" ]]; then
+      printf '  ✓ %s\n' "$label"
+    else
+      printf '  ✗ %s%s\n' "$label" "${detail:+ — $detail}"
+      fail=1
+    fi
+  }
+  printf 'autoheic doctor:\n'
+  if [[ "$(uname)" == "Darwin" ]]; then _check "macOS detected" PASS; else _check "macOS detected" FAIL "platform is $(uname)"; fi
+  if [[ -x /usr/bin/sips ]]; then _check "/usr/bin/sips present" PASS; else _check "/usr/bin/sips present" FAIL; fi
+  if command -v osascript >/dev/null; then _check "osascript present" PASS; else _check "osascript present" FAIL; fi
+  if [[ -f "$AUTOHEIC_SCRIPT_PATH" ]]; then _check "trigger .scpt installed" PASS; else _check "trigger .scpt installed" FAIL "$AUTOHEIC_SCRIPT_PATH"; fi
+  if [[ -f "$AUTOHEIC_CONFIG_FILE" ]]; then _check "config file exists" PASS; else _check "config file exists" FAIL "$AUTOHEIC_CONFIG_FILE"; fi
+  local fae
+  fae=$(osascript -e 'tell application "System Events" to return folder actions enabled' 2>/dev/null || true)
+  if [[ "$fae" == "true" ]]; then _check "Folder Actions enabled" PASS; else _check "Folder Actions enabled" FAIL "run 'autoheic add' to enable"; fi
+  local folders
+  folders=$(ah_list_folders)
+  if [[ -n "$folders" ]]; then
+    _check "at least one folder attached" PASS
+    while IFS= read -r f; do
+      [[ -z "$f" ]] && continue
+      if [[ -d "$f" ]]; then _check "watched dir exists: $f" PASS; else _check "watched dir exists: $f" FAIL "remove with: autoheic remove '$f'"; fi
+    done <<< "$folders"
+  else
+    _check "at least one folder attached" FAIL "use: autoheic add <folder>"
+  fi
+  if [[ -w "$(dirname -- "$AUTOHEIC_LOG")" ]]; then _check "log dir writable" PASS; else _check "log dir writable" FAIL "$AUTOHEIC_LOG"; fi
+  if [[ $fail -eq 0 ]]; then
+    printf '\nAll checks passed.\n'
+  else
+    printf '\nSome checks failed — see https://github.com/haider-nawaz/autoheic/blob/main/docs/DEBUGGING.md\n'
+  fi
+  return $fail
+}
+
+cmd_uninstall() {
+  local assume_yes=0
+  [[ "${1:-}" == "--yes" || "${1:-}" == "-y" ]] && assume_yes=1
+  if [[ $assume_yes -eq 0 ]]; then
+    cat <<EOF
+This will:
+  - detach autoheic from all watched folders
+  - remove the Folder Action trigger script
+  - remove $AUTOHEIC_CONFIG_DIR
+  - remove autoheic & heic-convert-one binaries from $SELF_DIR
+
+The log at $AUTOHEIC_LOG will be kept.
+
+EOF
+    printf 'Proceed? [y/N] '
+    read -r ans
+    [[ "$ans" =~ ^[yY] ]] || { echo "aborted"; exit 1; }
+  fi
+  AH_SCRIPT="$AUTOHEIC_SCRIPT_NAME" osascript <<'APPLESCRIPT' >/dev/null
+set scriptName to system attribute "AH_SCRIPT"
+tell application "System Events"
+  set toDelete to {}
+  repeat with fa in folder actions
+    set hasOurs to false
+    set otherScripts to 0
+    repeat with s in scripts of fa
+      if (name of s) is scriptName then
+        set hasOurs to true
+      else
+        set otherScripts to otherScripts + 1
+      end if
+    end repeat
+    if hasOurs then
+      if otherScripts is 0 then
+        set end of toDelete to (path of fa)
+      else
+        repeat with s in scripts of fa
+          if (name of s) is scriptName then delete s
+        end repeat
+      end if
+    end if
+  end repeat
+  repeat with p in toDelete
+    repeat with fa in folder actions
+      if (path of fa) is (p as text) then
+        delete fa
+        exit repeat
+      end if
+    end repeat
+  end repeat
+end tell
+APPLESCRIPT
+  rm -f -- "$AUTOHEIC_SCRIPT_PATH"
+  rm -rf -- "$AUTOHEIC_CONFIG_DIR"
+  rm -f -- "$SELF_DIR/heic-convert-one"
+  rm -f -- "$SELF_DIR/lib/common.sh"
+  rmdir "$SELF_DIR/lib" 2>/dev/null || true
+  rm -f -- "$SELF_DIR/autoheic"
+  printf 'Uninstalled. Log preserved at: %s\n' "$AUTOHEIC_LOG"
+}
+
+cmd_help() {
+  cat <<'EOF'
+autoheic — auto-convert HEIC photos dropped into watched folders.
+
+USAGE
+  autoheic <command> [args...]
+
+COMMANDS
+  status                       Show config, attached folders, recent log entries
+  list                         List folders currently watched
+  add <folder>                 Watch a folder (e.g. ~/Downloads or "downloads")
+  remove <folder>              Stop watching a folder
+  sweep [folder ...]           Convert pre-existing HEICs (defaults to all watched)
+  config [get|set] [key=val]   View/edit settings: format, quality, keep_originals
+  doctor                       Diagnose common problems
+  version                      Print version
+  uninstall [--yes]            Remove everything (preserves log)
+  help                         Show this message
+
+EXAMPLES
+  autoheic add ~/Pictures
+  autoheic config set format=png
+  autoheic config set quality=92
+  autoheic sweep ~/OldPhotos
+  autoheic status
+
+More: https://github.com/haider-nawaz/autoheic
+EOF
+}
+
+# ---------- entrypoint ----------
+
+if [[ $# -lt 1 ]]; then
+  cmd_help
+  exit 1
+fi
+sub="$1"; shift
+case "$sub" in
+  status)               cmd_status "$@" ;;
+  list|ls)              cmd_list "$@" ;;
+  add)                  cmd_add "$@" ;;
+  remove|rm)            cmd_remove "$@" ;;
+  config)               cmd_config "$@" ;;
+  sweep)                cmd_sweep "$@" ;;
+  doctor)               cmd_doctor "$@" ;;
+  uninstall)            cmd_uninstall "$@" ;;
+  version|--version|-v) cmd_version ;;
+  help|--help|-h)       cmd_help ;;
+  *)                    die "unknown command: $sub (try: autoheic help)" ;;
+esac
